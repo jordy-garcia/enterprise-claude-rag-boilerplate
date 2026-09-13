@@ -146,6 +146,7 @@ Export via OTLP (`OTEL_EXPORTER_OTLP_ENDPOINT`, default `http://localhost:4317`)
 | `GET` | `/health` | Liveness probe |
 | `GET` | `/ready` | Readiness probe (Postgres when `RAG_ENGINE=pgvector`) |
 | `POST` | `/api/v1/chat/completions` | Claude completion; optional `use_rag` |
+| `POST` | `/api/v1/chat/stream` | SSE stream of Claude tokens (`text/event-stream`) |
 | `POST` | `/api/v1/rag/completions` | Claude completion with RAG always on |
 | `POST` | `/api/v1/rag/documents` | Upsert a document embedding into pgvector |
 
@@ -167,6 +168,15 @@ curl -s http://127.0.0.1:8000/api/v1/rag/completions \
     "messages": [
       {"role": "user", "content": "Summarize our retrieval strategy"}
     ]
+  }'
+
+# SSE token stream (optional use_rag)
+curl -N http://127.0.0.1:8000/api/v1/chat/stream \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: text/event-stream' \
+  -d '{
+    "messages": [{"role": "user", "content": "Stream a short greeting"}],
+    "use_rag": false
   }'
 
 # Ingest a document (requires RAG_ENGINE=pgvector)

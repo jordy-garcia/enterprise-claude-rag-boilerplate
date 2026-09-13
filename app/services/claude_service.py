@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
+import time
+from collections.abc import AsyncIterator
 from typing import Any
 
 from app.core.bedrock_client import BedrockClient
 from app.core.config import Settings
-from app.core.exceptions import ValidationAppError
+from app.core.exceptions import AppException, ValidationAppError
 from app.core.logging import get_logger
 from app.core.telemetry import get_tracer
 from app.models.schemas import (
@@ -48,28 +51,7 @@ class ClaudeService:
             "claude.generate",
             attributes={"rag.enabled": request.use_rag},
         ):
-            messages = self._to_bedrock_messages(request.messages)
-            rag_context_injected = False
-
-            if request.use_rag:
-                last_user_content = request.messages[-1].content
-                context = await self._rag.build_context(
-                    last_user_content,
-                    top_k=self._settings.rag_top_k,
-                )
-                if context:
-                    messages[-1] = {
-                        "role": MessageRole.USER.value,
-                        "content": _RAG_CONTEXT_TEMPLATE.format(
-                            context=context,
-                            question=last_user_content,
-                        ),
-                    }
-                    rag_context_injected = True
-                    logger.info("rag_context_injected", context_chars=len(context))
-                else:
-                    logger.info("rag_enabled_no_context")
-
+            messages, rag_context_injected = await self._prepare_messages(request)
             system_prompt = request.system_prompt or self._settings.claude_system_prompt
 
             raw_response = await self._bedrock.invoke_claude(
@@ -84,6 +66,129 @@ class ClaudeService:
                 use_rag=request.use_rag,
                 rag_context_injected=rag_context_injected,
             )
+
+    async def generate_claude_stream(self, request: ChatRequest) -> AsyncIterator[str]:
+        """Yield SSE frames while streaming Claude tokens (optional RAG first).
+
+        Emits ``text/event-stream`` frames:
+        - ``event: meta`` — RAG flags before the first token
+        - ``event: token`` — each text delta from Bedrock
+        - ``event: done`` — final summary with total ``execution_time``
+        - ``event: error`` — domain failures mid-stream
+        """
+        started = time.perf_counter()
+        token_events = 0
+
+        with tracer.start_as_current_span(
+            "claude.generate_stream",
+            attributes={
+                "rag.enabled": request.use_rag,
+                "http.route": "/api/v1/chat/stream",
+            },
+        ) as span:
+            try:
+                messages, rag_context_injected = await self._prepare_messages(request)
+                system_prompt = request.system_prompt or self._settings.claude_system_prompt
+
+                yield _sse_frame(
+                    "meta",
+                    {
+                        "use_rag": request.use_rag,
+                        "rag_context_injected": rag_context_injected,
+                        "model_id": self._settings.bedrock_model_id,
+                    },
+                )
+
+                async for text in self._bedrock.invoke_claude_stream(
+                    messages=messages,
+                    system=system_prompt,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                ):
+                    token_events += 1
+                    yield _sse_frame("token", {"content": text})
+
+                duration_ms = round((time.perf_counter() - started) * 1000, 2)
+                span.set_attribute("stream.token_events", token_events)
+                span.set_attribute("stream.duration_ms", duration_ms)
+                span.set_attribute("rag.context_injected", rag_context_injected)
+                logger.info(
+                    "claude_stream_completed",
+                    use_rag=request.use_rag,
+                    rag_context_injected=rag_context_injected,
+                    token_events=token_events,
+                    execution_time=duration_ms,
+                )
+                yield _sse_frame(
+                    "done",
+                    {
+                        "use_rag": request.use_rag,
+                        "rag_context_injected": rag_context_injected,
+                        "model_id": self._settings.bedrock_model_id,
+                        "token_events": token_events,
+                        "execution_time": duration_ms,
+                    },
+                )
+            except AppException as exc:
+                duration_ms = round((time.perf_counter() - started) * 1000, 2)
+                span.set_attribute("stream.duration_ms", duration_ms)
+                span.record_exception(exc)
+                logger.exception(
+                    "claude_stream_failed",
+                    error_code=exc.error_code,
+                    execution_time=duration_ms,
+                )
+                yield _sse_frame(
+                    "error",
+                    {
+                        "error_code": exc.error_code,
+                        "message": exc.message,
+                        "details": exc.details,
+                        "execution_time": duration_ms,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                duration_ms = round((time.perf_counter() - started) * 1000, 2)
+                span.set_attribute("stream.duration_ms", duration_ms)
+                span.record_exception(exc)
+                logger.exception("claude_stream_unhandled_error", execution_time=duration_ms)
+                yield _sse_frame(
+                    "error",
+                    {
+                        "error_code": "internal_error",
+                        "message": "An unexpected error occurred during streaming",
+                        "execution_time": duration_ms,
+                    },
+                )
+
+    async def _prepare_messages(
+        self,
+        request: ChatRequest,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Format messages and optionally inject RAG context into the last user turn."""
+        messages = self._to_bedrock_messages(request.messages)
+        rag_context_injected = False
+
+        if request.use_rag:
+            last_user_content = request.messages[-1].content
+            context = await self._rag.build_context(
+                last_user_content,
+                top_k=self._settings.rag_top_k,
+            )
+            if context:
+                messages[-1] = {
+                    "role": MessageRole.USER.value,
+                    "content": _RAG_CONTEXT_TEMPLATE.format(
+                        context=context,
+                        question=last_user_content,
+                    ),
+                }
+                rag_context_injected = True
+                logger.info("rag_context_injected", context_chars=len(context))
+            else:
+                logger.info("rag_enabled_no_context")
+
+        return messages, rag_context_injected
 
     def _to_bedrock_messages(self, messages: list[ChatMessage]) -> list[dict[str, Any]]:
         """Convert Pydantic chat messages to Claude 3 Messages API dicts."""
@@ -125,3 +230,8 @@ class ClaudeService:
                 "role": raw_response.get("role"),
             },
         )
+
+
+def _sse_frame(event: str, data: dict[str, Any]) -> str:
+    """Format one Server-Sent Event frame."""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"

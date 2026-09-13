@@ -188,6 +188,79 @@ async def test_chat_validation_requires_final_user_turn(client: AsyncClient) -> 
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_sse_tokens(
+    client: AsyncClient,
+    app: Any,
+) -> None:
+    """SSE endpoint streams token events from a mocked Bedrock stream."""
+
+    async def fake_claude_stream(**_kwargs: Any) -> Any:
+        for part in ("Hello", " ", "from", " ", "stream"):
+            yield part
+
+    bedrock = app.dependency_overrides[get_bedrock_client]()
+    bedrock.invoke_claude_stream = fake_claude_stream
+
+    async with client.stream(
+        "POST",
+        "/api/v1/chat/stream",
+        json={
+            "messages": [{"role": "user", "content": "Stream please"}],
+            "use_rag": False,
+        },
+    ) as response:
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        body = ""
+        async for chunk in response.aiter_text():
+            body += chunk
+
+    assert "event: meta" in body
+    assert "event: token" in body
+    assert '"content": "Hello"' in body
+    assert '"content": "stream"' in body
+    assert "event: done" in body
+    assert '"execution_time"' in body
+    assert "event: error" not in body
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_with_rag_includes_meta_flag(
+    client: AsyncClient,
+    app: Any,
+) -> None:
+    async def fake_claude_stream(**_kwargs: Any) -> Any:
+        yield "ok"
+
+    rag = MockRagEngine(
+        corpus=[
+            RetrievedChunk(
+                content="Streaming works with retrieved pgvector context.",
+                source="docs/stream.md",
+                score=0.95,
+            )
+        ]
+    )
+    app.dependency_overrides[get_rag_engine] = lambda: rag
+    bedrock = app.dependency_overrides[get_bedrock_client]()
+    bedrock.invoke_claude_stream = fake_claude_stream
+
+    async with client.stream(
+        "POST",
+        "/api/v1/chat/stream",
+        json={
+            "messages": [{"role": "user", "content": "Explain streaming RAG"}],
+            "use_rag": True,
+        },
+    ) as response:
+        body = "".join([chunk async for chunk in response.aiter_text()])
+
+    assert response.status_code == 200
+    assert '"rag_context_injected": true' in body
+    assert "event: done" in body
+
+
+@pytest.mark.asyncio
 async def test_bedrock_failure_returns_502(
     client: AsyncClient,
     app: Any,
