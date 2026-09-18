@@ -1,103 +1,172 @@
-# enterprise-claude-rag-boilerplate
+# Enterprise Claude RAG Boilerplate
 
-Production-ready FastAPI starter for Anthropic Claude on **AWS Bedrock**, with **pgvector** RAG, **structured JSON logging**, and **OpenTelemetry** tracing.
+A production-shaped FastAPI service for **Claude on AWS Bedrock** with an optional **pgvector RAG** path, designed so platform and product teams can ship enterprise assistants without reinventing authz-adjacent plumbing, retrieval wiring, or observability every time.
 
 **Author:** Jordy Garcia | Senior Software Architect
 
-Managed with [uv](https://docs.astral.sh/uv/) for environments, lockfiles, and packaging.
+---
+
+## The problem this solves
+
+Most “Claude + RAG” demos fail the jump to enterprise for predictable reasons:
+
+1. **Vendor lock-in at the wrong layer** — calling Anthropic’s public API directly when the organization already standardized on Bedrock (IAM, VPC endpoints, model access, audit).
+2. **Retrieval bolted on as an afterthought** — embeddings, distance metrics, and prompt injection living inline in route handlers, so swapping stores or turning RAG off becomes a rewrite.
+3. **No operability story** — unstructured logs, no correlation between a slow chat and a slow embed/search/LLM hop, and health checks that lie when Postgres is down.
+4. **Local/prod divergence** — developers cannot exercise the API without AWS credentials *and* a vector DB on day one, so the “starter” never gets adopted.
+
+This repository is a **bounded, replaceable skeleton**: a chat API that can answer with or without retrieved context, runs against Bedrock, stores vectors in Postgres when you need them, and emits logs/traces that survive a CloudWatch or Datadog pipeline. It is intentionally *not* a full knowledge platform (chunking pipelines, ACL-aware retrieval, eval harnesses). Those belong as adjacent services; this service owns the request path.
+
+---
+
+## Design goals
+
+| Goal | What it means here |
+| --- | --- |
+| Ship the request path first | Completions, optional RAG, SSE streaming, document upsert — not a document portal |
+| Keep I/O boundaries explicit | Routers → services → Bedrock / RAG / DB; no SDK calls in handlers |
+| Fail closed on readiness | `/ready` reflects Postgres when RAG is real; `/health` stays cheap for liveness |
+| Develop without the full stack | `RAG_ENGINE=mock` + mocked Bedrock in tests |
+| Observability as a default | JSON logs with `trace_id` / `span_id`; OTEL across FastAPI, SQL, and Bedrock |
+
+---
+
+## Architecture
+
+```text
+                    ┌─────────────────────────────────────────┐
+                    │              FastAPI (main)              │
+                    │  CORS · request logging · OTEL · DI      │
+                    └───────────────┬─────────────────────────┘
+                                    │
+              ┌─────────────────────┼─────────────────────┐
+              ▼                     ▼                     ▼
+        /api/v1/chat          /api/v1/rag            /health · /ready
+              │                     │
+              └──────────┬──────────┘
+                         ▼
+                 ClaudeService
+            (prompt prep · RAG flag · stream)
+                         │
+            ┌────────────┴────────────┐
+            ▼                         ▼
+      BaseRagEngine              BedrockClient
+   (mock | pgvector)         (embed · invoke · stream)
+            │                         │
+            ▼                         ▼
+     PgVectorClient              AWS Bedrock
+     (asyncpg pool)           Claude + Titan embeds
+```
+
+### Request path
+
+1. Validate the conversation contract (Pydantic; last turn must be `user`).
+2. If RAG is enabled, embed the latest user text, run similarity search, format a context block, and inject it into the Messages payload.
+3. Call Claude on Bedrock (sync completion or SSE token stream).
+4. Return a typed response (or stream frames) with usage/timing metadata where available.
+
+Chat exposes RAG as a **per-request flag** (`use_rag`). The dedicated RAG routes force retrieval on and own ingest. That split keeps a general chat surface usable for non-grounded flows while giving product teams a clear “always grounded” API.
+
+---
+
+## Architectural decisions
+
+### Bedrock instead of the Anthropic public API
+
+Enterprise constraints usually win: model enablement, IAM roles (prefer over long-lived keys), PrivateLink, and centralized spend. The service talks to Bedrock via `boto3`, wrapped so call sites stay async-friendly (`asyncio.to_thread`) and individually traced. Swapping model IDs is configuration, not a code fork.
+
+### Pluggable RAG behind an interface
+
+`BaseRagEngine` defines `retrieve` / `build_context`. Production uses `PgVectorRagEngine`; local and CI use `MockRagEngine`. The chat service depends on the abstraction, not on SQL. Replacing pgvector with OpenSearch, a managed vector service, or a sidecar later should not rewrite handlers.
+
+**Why Postgres + pgvector (default prod engine):** many enterprises already run Postgres for OLTP. Co-locating vectors avoids a second operational plane early on. Distance metric (`cosine` / `inner_product`) and embedding dimension are settings — change Titan (or another embed model) and align `PGVECTOR_EMBEDDING_DIM` + `schema.sql`.
+
+**What we deliberately do not do in-process:** heavy document chunking, ACL filtering, hybrid BM25+vector, or re-ranking. Ingest accepts a content payload and upserts an embedding; upstream systems own how documents are split and authorized.
+
+### Async FastAPI with a sync AWS SDK
+
+FastAPI and asyncpg are native async; Bedrock’s SDK is not. Isolating Bedrock behind a client and offloading to threads keeps the event loop responsive without pretending boto3 is async. Spans wrap embed and invoke so latency attribution stays honest.
+
+### Structured logs + OpenTelemetry from day zero
+
+Debugging “chat was slow” without knowing whether embed, ANN search, or generation dominated is expensive. structlog emits JSON (CloudWatch / Datadog–friendly) and attaches active `trace_id` / `span_id`. OTEL instruments FastAPI, HTTPX, asyncpg, plus manual Bedrock spans. Disable the SDK locally with `OTEL_SDK_DISABLED=true` so tests do not require a collector.
+
+### Health vs readiness
+
+- **`/health`** — process is up (orchestrator liveness).
+- **`/ready`** — dependencies required to serve traffic; when `RAG_ENGINE=pgvector`, Postgres connectivity is checked.
+
+Lying readiness is worse than a failed deploy.
+
+### Packaging and runtime
+
+- **[uv](https://docs.astral.sh/uv/)** for lockfiles and reproducible envs (`pyproject.toml` + `uv.lock`).
+- **Multi-stage Docker** — builder with uv, slim runtime, non-root user, image `HEALTHCHECK` on `/health`.
+- **Python ≥ 3.11**, Pydantic v2 settings — typed config, fail fast on bad env.
+
+### Testing stance
+
+The suite mocks Bedrock. No AWS credentials required to prove routing, validation, and orchestration. RAG can stay on `mock` until a real Postgres is available. That keeps CI cheap and the contract of the API honest.
+
+---
 
 ## Tech stack
 
-| Layer | Choice |
-| --- | --- |
-| Package / env manager | uv (`pyproject.toml` + `uv.lock`) |
-| API | FastAPI (async) |
-| Validation / settings | Pydantic v2 + pydantic-settings |
-| AWS SDK | boto3 via `asyncio.to_thread` |
-| Vector store | PostgreSQL + pgvector (`asyncpg` / SQLAlchemy async) |
-| Logging | structlog (JSON for CloudWatch / Datadog) |
-| Tracing | OpenTelemetry (FastAPI, HTTPX, asyncpg + Bedrock spans) |
-| Tests | pytest + pytest-asyncio + httpx |
-| Server | Uvicorn |
-| Python | ≥ 3.11 |
+| Concern | Choice | Rationale (short) |
+| --- | --- | --- |
+| API | FastAPI + Uvicorn | Async request path, OpenAPI for free |
+| Config / contracts | Pydantic v2 + pydantic-settings | Typed boundaries at the edge |
+| LLM / embeds | AWS Bedrock (Claude + Titan) | Enterprise control plane |
+| Vectors | PostgreSQL + pgvector | Familiar ops, good enough ANN to start |
+| Logging | structlog (JSON) | Machine-parseable, correlatable |
+| Tracing | OpenTelemetry (OTLP) | Vendor-neutral export |
+| Tooling | uv, pytest, ruff, mypy | Reproducible + strict |
+
+---
 
 ## Project layout
+
+Boundaries match the architecture: **API** is thin, **services** own orchestration, **core** owns cross-cutting I/O and observability, **db** owns the vector store.
 
 ```text
 app/
 ├── api/
-│   ├── dependencies.py
+│   ├── dependencies.py      # DI: settings, Bedrock, RAG engine
 │   └── v1/
-│       ├── chat.py          # Chat completions
-│       └── rag.py           # RAG completions + document ingest
+│       ├── chat.py          # Completions + SSE (optional RAG)
+│       └── rag.py           # Always-on RAG + document upsert
 ├── core/
-│   ├── config.py
-│   ├── bedrock_client.py
-│   ├── logging.py           # JSON structured logger + request middleware
-│   ├── telemetry.py         # OpenTelemetry TracerProvider setup
-│   └── exceptions.py
+│   ├── config.py            # Environment → Settings
+│   ├── bedrock_client.py    # Bedrock invoke / embed / stream
+│   ├── logging.py           # JSON logger + request middleware
+│   ├── telemetry.py         # TracerProvider + instrumentations
+│   └── exceptions.py        # Domain errors → HTTP mapping
 ├── db/
-│   ├── pgvector_client.py   # Async pool, similarity search, upsert
-│   └── schema.sql           # Reference DDL for documents + vector index
-├── models/schemas.py
+│   ├── pgvector_client.py   # Pool, similarity search, upsert
+│   └── schema.sql           # Reference DDL + vector index
+├── models/schemas.py        # Request/response contracts
 ├── services/
-│   ├── claude_service.py
-│   └── rag_engine.py        # PgVectorRagEngine (+ MockRagEngine for tests)
-└── main.py                  # CORS, logging, OTEL, /health, /ready
-tests/
-├── conftest.py
-├── test_health.py
-└── test_chat.py
+│   ├── claude_service.py    # Prompt prep + generation
+│   └── rag_engine.py        # BaseRagEngine + pgvector / mock
+└── main.py                  # Lifespan, middleware, probes, routers
+tests/                       # Health + chat; Bedrock mocked
 ```
 
-## Local setup (uv)
+---
 
-```bash
-# 1. Create a virtual environment
-uv venv
+## RAG pipeline (production)
 
-# 2. Activate it
-source .venv/bin/activate
+When retrieval is enabled (`use_rag=true` or `/api/v1/rag/completions`):
 
-# 3. Install runtime + dev dependencies
-uv sync --extra dev
+1. `BedrockClient.embed_text()` — Titan embedding (traced).
+2. `PgVectorClient.similarity_search()` — `<=>` (cosine) or `<#>` (inner product).
+3. Top-K chunks formatted and injected into the Claude Messages prompt.
+4. `BedrockClient.invoke_claude()` (or stream) produces the answer.
 
-# 4. Configure environment
-cp .env.example .env
-# Edit AWS credentials; keep RAG_ENGINE=mock until Postgres is ready
+Enable with Postgres + pgvector:
 
-# 5. Run the API with hot reload
-uv run uvicorn app.main:app --reload
-```
-
-Docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
-
-### Useful uv commands
-
-```bash
-uv add <package>
-uv add --dev <package>
-uv remove <package>
-uv lock
-uv run pytest
-uv run uvicorn app.main:app --reload
-```
-
-## Tests
-
-Bedrock is mocked in the suite — no AWS credentials required:
-
-```bash
-uv sync --extra dev
-uv run pytest
-uv run pytest -v --tb=short
-```
-
-## Enable production RAG (pgvector)
-
-1. Run PostgreSQL with the [pgvector](https://github.com/pgvector/pgvector) extension.
-2. Apply [`app/db/schema.sql`](app/db/schema.sql) (adjust `vector(1024)` if you change dimensions).
-3. Set in `.env`:
+1. Apply [`app/db/schema.sql`](app/db/schema.sql) (adjust `vector(1024)` if dimensions change).
+2. Set:
 
 ```bash
 DATABASE_URL=postgresql+asyncpg://rag:rag@localhost:5432/rag
@@ -108,50 +177,29 @@ RAG_ENGINE=pgvector
 BEDROCK_EMBEDDING_MODEL_ID=amazon.titan-embed-text-v2:0
 ```
 
-Pipeline when `use_rag=true`:
-
-1. `BedrockClient.embed_text()` → Titan embedding (async, traced).
-2. `PgVectorClient.similarity_search()` → `<=>` (cosine) or `<#>` (inner product).
-3. Top-K chunks injected into the Claude Messages prompt.
-4. `BedrockClient.invoke_claude()` generates the answer.
+---
 
 ## Observability
 
-### Structured JSON logging
+**Logs** (`app/core/logging.py`): ISO-8601 UTC timestamp, level, `trace_id` / `span_id`, plus `path`, `method`, `status_code`, `execution_time` via `RequestLoggingMiddleware`. Set `LOG_JSON=true` for CloudWatch Logs Insights / Datadog.
 
-`app/core/logging.py` configures structlog with:
+**Traces** (`app/core/telemetry.py`): FastAPI, HTTPX, asyncpg, and manual spans around Bedrock embed/invoke and Claude generation. Export OTLP to `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://localhost:4317`).
 
-- `timestamp` (ISO-8601 UTC)
-- `level`
-- `trace_id` / `span_id` (from the active OpenTelemetry span)
-- `path`, `method`, `status_code`, `execution_time` (ms) via `RequestLoggingMiddleware`
+---
 
-Compatible with CloudWatch Logs Insights and Datadog log pipelines (`LOG_JSON=true`).
+## API surface
 
-### OpenTelemetry
-
-`app/core/telemetry.py` initializes a `TracerProvider` and instruments:
-
-- FastAPI (inbound requests)
-- HTTPX (outbound HTTP)
-- asyncpg (SQL)
-- Manual spans around Bedrock `invoke_model` / `embed_text` / Claude generation
-
-Export via OTLP (`OTEL_EXPORTER_OTLP_ENDPOINT`, default `http://localhost:4317`). Disable for local/tests with `OTEL_SDK_DISABLED=true`.
-
-## API overview
-
-| Method | Path | Description |
+| Method | Path | Role |
 | --- | --- | --- |
-| `GET` | `/health` | Liveness probe |
-| `GET` | `/ready` | Readiness probe (Postgres when `RAG_ENGINE=pgvector`) |
-| `POST` | `/api/v1/chat/completions` | Claude completion; optional `use_rag` |
-| `POST` | `/api/v1/chat/stream` | SSE stream of Claude tokens (`text/event-stream`) |
-| `POST` | `/api/v1/rag/completions` | Claude completion with RAG always on |
-| `POST` | `/api/v1/rag/documents` | Upsert a document embedding into pgvector |
+| `GET` | `/health` | Liveness |
+| `GET` | `/ready` | Readiness (Postgres when `RAG_ENGINE=pgvector`) |
+| `POST` | `/api/v1/chat/completions` | Claude completion; RAG optional |
+| `POST` | `/api/v1/chat/stream` | SSE token stream (`text/event-stream`) |
+| `POST` | `/api/v1/rag/completions` | Completion with RAG always on |
+| `POST` | `/api/v1/rag/documents` | Upsert document + embedding |
 
 ```bash
-# Optional RAG via flag
+# Optional RAG
 curl -s http://127.0.0.1:8000/api/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
@@ -161,7 +209,7 @@ curl -s http://127.0.0.1:8000/api/v1/chat/completions \
     "use_rag": true
   }'
 
-# Dedicated RAG path
+# Always-on RAG
 curl -s http://127.0.0.1:8000/api/v1/rag/completions \
   -H 'Content-Type: application/json' \
   -d '{
@@ -170,7 +218,7 @@ curl -s http://127.0.0.1:8000/api/v1/rag/completions \
     ]
   }'
 
-# SSE token stream (optional use_rag)
+# SSE stream
 curl -N http://127.0.0.1:8000/api/v1/chat/stream \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
@@ -179,7 +227,7 @@ curl -N http://127.0.0.1:8000/api/v1/chat/stream \
     "use_rag": false
   }'
 
-# Ingest a document (requires RAG_ENGINE=pgvector)
+# Ingest (requires RAG_ENGINE=pgvector)
 curl -s http://127.0.0.1:8000/api/v1/rag/documents \
   -H 'Content-Type: application/json' \
   -d '{
@@ -189,28 +237,79 @@ curl -s http://127.0.0.1:8000/api/v1/rag/documents \
   }'
 ```
 
-## Docker
+---
+
+## Local setup
+
+```bash
+uv venv
+source .venv/bin/activate
+uv sync --extra dev
+
+cp .env.example .env
+# Configure AWS (prefer profile/role). Keep RAG_ENGINE=mock until Postgres is ready.
+
+uv run uvicorn app.main:app --reload
+```
+
+OpenAPI: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+```bash
+uv add <package>
+uv lock
+uv run pytest
+uv run uvicorn app.main:app --reload
+```
+
+### Tests
+
+```bash
+uv sync --extra dev
+uv run pytest
+```
+
+Bedrock is mocked — no cloud credentials required for the default suite.
+
+### Docker
 
 ```bash
 docker build -t enterprise-claude-rag-boilerplate .
 docker run --rm -p 8000:8000 --env-file .env enterprise-claude-rag-boilerplate
 ```
 
-## Environment variables
+---
 
-See [`.env.example`](.env.example). Highlights:
+## Configuration
+
+See [`.env.example`](.env.example). High-signal variables:
 
 | Variable | Purpose |
 | --- | --- |
 | `BEDROCK_MODEL_ID` | Claude model on Bedrock |
-| `BEDROCK_EMBEDDING_MODEL_ID` | Titan (or other) embedding model |
+| `BEDROCK_EMBEDDING_MODEL_ID` | Embedding model (e.g. Titan) |
 | `DATABASE_URL` | SQLAlchemy async URL (`postgresql+asyncpg://...`) |
 | `RAG_ENGINE` | `pgvector` or `mock` |
 | `PGVECTOR_DISTANCE` | `cosine` (`<=>`) or `inner_product` (`<#>`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector |
-| `LOG_JSON` | JSON logs for CloudWatch / Datadog |
+| `OTEL_SDK_DISABLED` | Disable tracing (local/CI) |
+| `LOG_JSON` | JSON logs for log platforms |
 
 Prefer IAM roles in AWS over long-lived access keys.
+
+---
+
+## Non-goals (for clarity)
+
+This boilerplate does **not** attempt to be:
+
+- A multi-tenant document CMS or ACL-aware search layer
+- An evaluation / red-team harness for RAG quality
+- A workflow orchestrator (agents, tools, multi-step planners)
+- A replacement for your org’s API gateway, authN/Z, or secrets manager
+
+Use it as the **generation + retrieval request service**, and compose those concerns around it.
+
+---
 
 ## Author
 
